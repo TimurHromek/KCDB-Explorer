@@ -9,13 +9,13 @@
     const TYPE_LABELS = {
         2: 'Chat',
         13: 'Trade',
-        20: 'Bot',
     };
 
     function typeLabel(t) {
         return TYPE_LABELS[t] || `Type ${t}`;
     }
-    
+
+
     async function fetchMessages(params = {}) {
         const clean = {}; // typeof null === 'object'. the language is gaslighting me
         for (const [k, v] of Object.entries(params)) {
@@ -565,19 +565,59 @@
         contextListEl.innerHTML = '<div class="loading-screen"><div class="spinner"></div><span>Loading context…</span></div>';
 
         try {
-            const [beforeData, afterData, currentMsgData] = await Promise.all([
-                fetchMessages({ before_id: messageId, limit: 15 }),
-                fetchMessages({ since_id: messageId, limit: 15 }),
-                fetchMessages({ exact_id: messageId })
+            const id = parseInt(messageId);
+
+            // Fetch before and current in parallel
+            const [beforeData, currentMsgData] = await Promise.all([
+                fetchMessages({ before_id: id, limit: 15 }),
+                fetchMessages({ exact_id: id })
             ]);
 
+            // before: descending older msgs → reverse for chronological
             const before = (beforeData.results || []).reverse();
-            const after = (afterData.results || []);
+
+            // Binary search for the tightest before_id ceiling that gives us ≥15 msgs.
+            // IDs are sequential so we can bisect: if window [id, mid] has <15 msgs,
+            // the ceiling is too low — go higher. If ≥15, try tighter (go lower).
+            // This finds the smallest window containing exactly 15 msgs after the anchor.
+            let after = [];
+            let lo = id + 1, hi = id + 100000;
+
+            // seed hi: make sure it actually contains ≥15 msgs, double until it does
+            while (true) {
+                const probe = await fetchMessages({ since_id: id, before_id: hi, limit: 15 });
+                if ((probe.results || []).length >= 15) break;
+                if ((probe.results || []).length > 0 && hi >= id + 3200000) {
+                    // near end of DB, just use what we have
+                    after = (probe.results || []).reverse();
+                    break;
+                }
+                hi *= 2;
+            }
+
+            if (after.length === 0) {
+                // binary search: find smallest ceiling with ≥15 results
+                while (lo < hi - 1) {
+                    const mid = Math.floor((lo + hi) / 2);
+                    const res = await fetchMessages({ since_id: id, before_id: mid, limit: 15 });
+                    const count = (res.results || []).length;
+                    if (count >= 15) {
+                        hi = mid; // tight enough, try smaller
+                    } else {
+                        lo = mid; // not enough msgs, need wider
+                    }
+                }
+                // hi is now the tightest ceiling with ≥15 msgs — fetch final result
+                const final = await fetchMessages({ since_id: id, before_id: hi, limit: 15 });
+                // results are descending within window → reverse for chronological
+                after = (final.results || []).reverse();
+            }
+
             const current = currentMsgData.results?.length > 0
                 ? currentMsgData.results[0]
-                : { id: parseInt(messageId), message: '[Message not found]', received_at: '—', user_name: 'Unknown' };
+                : { id, message: '[Message not found]', received_at: '—', user_name: 'Unknown' };
 
-            renderContextList(contextListEl, [...before, current, ...after], parseInt(messageId));
+            renderContextList(contextListEl, [...before, current, ...after], id);
         } catch (err) {
             contextListEl.innerHTML = `<div class="empty-state"><p>Failed to load context: ${err.message}</p></div>`;
         }
@@ -646,4 +686,3 @@
     });
 
 })();
-
